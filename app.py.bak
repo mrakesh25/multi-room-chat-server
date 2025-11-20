@@ -1,0 +1,972 @@
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask_socketio import SocketIO, join_room, leave_room, emit
+from models import db, User, Message, Room
+from datetime import datetime
+import time, uuid
+from functools import wraps
+import emoji
+import google.generativeai as genai
+import traceback
+import random
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+db.init_app(app)
+
+# Create database tables
+with app.app_context():
+    db.create_all()
+
+# Dictionary to store online users and chat history
+online_users = {}
+chat_history = {}  # Store messages by room
+
+# Initialize AI model
+ai_model = None
+
+def init_gemini():
+    """Initialize the Gemini AI model"""
+    try:
+        # Configure the API key
+        genai.configure(api_key="your-api-key-here")  # Replace with your actual API key
+        
+        # Set up the model
+        model = genai.GenerativeModel('gemini-pro')
+        print("Gemini AI model initialized successfully")
+        return model
+    except Exception as e:
+        print(f"Error initializing Gemini AI: {e}")
+        traceback.print_exc()
+        return None
+
+# Initialize the AI model
+ai_model = init_gemini()
+
+def get_ai_response(message):
+    """Generate AI response using Gemini or fallback to basic responses"""
+    try:
+        # Check if AI model is available
+        if ai_model is None:
+            # Fallback responses if AI is not available
+            responses = {
+                "hello": "Hello! I'm your chat assistant. How can I help you today?",
+                "hi": "Hi there! What can I do for you?",
+                "help": "I can help you with:\n- Chat room navigation\n- General questions\n- Basic assistance\nJust let me know what you need!",
+                "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+                "default": [
+                    "I'm here to help! What would you like to know?",
+                    "How can I assist you today?",
+                    "Feel free to ask me anything!",
+                    "I'm listening! What's on your mind?"
+                ]
+            }
+            
+            message_lower = message.lower()
+            for key, response in responses.items():
+                if key in message_lower:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(responses["default"])
+            
+        # If AI model is available, use it
+        try:
+            generation_config = {
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200,
+            }
+            
+            response = ai_model.generate_content(
+                message,
+                generation_config=generation_config
+            )
+            
+            if response and response.text:
+                # Limit response length if needed
+                text = response.text.strip()
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                return text
+            return "I couldn't generate a response at this moment."
+        except Exception as inner_e:
+            print(f"Error with Gemini response: {inner_e}")
+            traceback.print_exc()
+            return "I encountered an error with my AI service. Using a simpler response!"
+                
+    except Exception as e:
+        print(f"Error in get_ai_response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble, but I'm still here to help!"
+            
+            message = message.lower()
+            for key, response in responses.items():
+                if key in message:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(responses["default"])
+
+        # If AI model is available, use it
+        try:
+            generation_config = {
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200,
+            }
+            
+            response = ai_model.generate_content(
+                message,
+                generation_config=generation_config
+            )
+            
+            if response and response.text:
+                # Limit response length if needed
+                text = response.text.strip()
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                return text
+            return "I couldn't generate a response at this moment."
+        except Exception as ai_error:
+            print(f"Error with Gemini response: {ai_error}")
+            traceback.print_exc()
+            return "I encountered an error with my AI service. Using a simpler response!"
+            
+    except Exception as e:
+        print(f"Error in get_ai_response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble, but I'm still here to help!"
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/')
+@login_required
+def index():
+    rooms = Room.query.all()
+    return render_template('index.html', 
+                         rooms=rooms, 
+                         username=session.get('username'),
+                         user_id=session.get('user_id'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = User.query.filter_by(username=username).first()
+        
+        if user and user.check_password(password):
+            session['user_id'] = user.id
+            session['username'] = user.username
+            return redirect(url_for('index'))
+        
+    return render_template('login.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        if User.query.filter_by(username=username).first():
+            return "Username already exists!"
+        
+        user = User(username=username)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+        
+        return redirect(url_for('login'))
+    
+    return render_template('register.html')
+
+# User joins a room
+@socketio.on('join')
+def on_join(data):
+    if 'user_id' not in session:
+        return
+    
+    username = session['username']
+    room = data.get('room')
+    join_room(room)
+    
+    # Add user to online users for this room
+    if room not in online_users:
+        online_users[room] = set()
+    online_users[room].add(username)
+    
+    # Initialize chat history for room if not exists
+    if room not in chat_history:
+        chat_history[room] = []
+    
+    # Create room if it doesn't exist
+    if not Room.query.filter_by(name=room).first():
+        new_room = Room(name=room)
+        db.session.add(new_room)
+        db.session.commit()
+    
+    # Send existing chat history to the user
+    for msg in chat_history[room]:
+        socketio.emit('message', msg, to=request.sid)
+    
+    payload = {
+        'id': str(uuid.uuid4()),
+        'msg': f'{username} has joined the room {room}.',
+        'username': 'system',
+        'system': True,
+        'ts': int(time.time() * 1000)
+    }
+    socketio.emit('message', payload, to=room)
+    chat_history[room].append(payload)
+    
+    # Send welcome message from AI Assistant
+    ai_welcome = get_ai_response(f"Welcome {username} to {room}")
+    if ai_welcome:
+        ai_payload = {
+            'id': str(uuid.uuid4()),
+            'msg': f'AI Assistant: {ai_welcome}',
+            'username': 'AI Assistant',
+            'system': True,
+            'ts': int(time.time() * 1000)
+        }
+        chat_history[room].append(ai_payload)
+        socketio.emit('message', ai_payload, to=room)
+    
+    # Emit to everyone in the room including the joining user
+    socketio.emit('update_users', {'users': list(online_users[room])}, to=room)
+    # Also emit to the joining user specifically to ensure they get the user list
+    socketio.emit('update_users', {'users': list(online_users[room])}, to=request.sid)
+
+# User leaves a room
+@socketio.on('leave')
+def on_leave(data):
+    username = data.get('username')
+    room = data.get('room')
+    leave_room(room)
+    
+    # Remove user from online users
+    if room in online_users and username in online_users[room]:
+        online_users[room].remove(username)
+        
+    payload = {
+        'id': str(uuid.uuid4()),
+        'msg': f'{username} has left the room {room}.',
+        'system': True,
+        'ts': int(time.time() * 1000)
+    }
+    socketio.emit('message', payload, to=room)
+    
+    # Update the user list for everyone in the room
+    if room in online_users:
+        socketio.emit('update_users', {'users': list(online_users[room])}, to=room)
+
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask_socketio import SocketIO, join_room, leave_room
+from models import db, User, Message, Room
+from datetime import datetime
+import time, uuid
+from functools import wraps
+import emoji
+import google.generativeai as genai
+from threading import Thread
+from queue import Queue
+import traceback
+import random
+
+# Initialize Flask
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*")
+db.init_app(app)
+
+# Create database tables
+with app.app_context():
+    db.create_all()
+
+# Dictionary to store online users and chat history
+online_users = {}
+chat_history = {}  # Store messages by room
+
+# Initialize AI model
+ai_model = None
+
+def init_gemini():
+    """Initialize the Gemini AI model"""
+    try:
+        # Configure the API key
+        genai.configure(api_key="your-api-key-here")  # Replace with your actual API key
+        
+        # Set up the model
+        model = genai.GenerativeModel('gemini-pro')
+        
+        # Test the model
+        test_response = model.generate_content("Test message")
+        if test_response and test_response.text:
+            print("Gemini AI model initialized successfully")
+            return model
+        else:
+            print("Model initialization failed - no response from test")
+            return None
+    except Exception as e:
+        print(f"Error initializing Gemini AI: {e}")
+        traceback.print_exc()
+        return None
+
+# Initialize the AI model
+ai_model = init_gemini()
+
+def get_ai_response(message):
+    """Generate AI response using Gemini or fallback to basic responses"""
+    try:
+        # Check if AI model is available
+        if ai_model is None:
+            # Fallback responses if AI is not available
+            fallback_responses = {
+                "hello": "Hello! I'm your chat assistant. How can I help you today?",
+                "hi": "Hi there! What can I do for you?",
+                "help": "I can help you with:\n- Chat room navigation\n- General questions\n- Basic assistance\nJust let me know what you need!",
+                "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+                "default": [
+                    "I'm here to help! What would you like to know?",
+                    "How can I assist you today?",
+                    "Feel free to ask me anything!",
+                    "I'm listening! What's on your mind?"
+                ]
+            }
+            
+            message_lower = message.lower()
+            for key, response in fallback_responses.items():
+                if key in message_lower:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(fallback_responses["default"])
+
+        # If AI model is available, use it
+        try:
+            generation_config = {
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200
+            }
+            
+            response = ai_model.generate_content(message, generation_config=generation_config)
+            
+            if response and response.text:
+                # Limit response length if needed
+                text = response.text.strip()
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                return text
+            return "I couldn't generate a response at this moment."
+        except Exception as inner_e:
+            print(f"Error with Gemini response: {inner_e}")
+            traceback.print_exc()
+            return "I encountered an error with my AI service. Using a simpler response!"
+            
+    except Exception as e:
+        print(f"Error in get_ai_response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble, but I'm still here to help!"
+
+# Message handling
+@socketio.on('message')
+def handle_message(data):
+    if 'user_id' not in session:
+        return
+    
+    username = session.get('username')
+    room = data.get('room')
+    message_text = data.get('msg')
+    
+    if not username or not room or not message_text:
+        return
+    
+    # Create message payload
+    message_payload = {
+        'id': str(uuid.uuid4()),
+        'msg': f'{username}: {message_text}',
+        'username': username,
+        'system': False,
+        'ts': int(time.time() * 1000)
+    }
+    
+    # Store in chat history and emit to room
+    if room not in chat_history:
+        chat_history[room] = []
+    chat_history[room].append(message_payload)
+    socketio.emit('message', message_payload, to=room)
+    
+    # Get AI response
+    try:
+        ai_response = get_ai_response(message_text)
+        if ai_response:
+            ai_payload = {
+                'id': str(uuid.uuid4()),
+                'msg': f'AI Assistant: {ai_response}',
+                'username': 'AI Assistant',
+                'system': True,
+                'ts': int(time.time() * 1000)
+            }
+            chat_history[room].append(ai_payload)
+            socketio.emit('message', ai_payload, to=room)
+    except Exception as e:
+        print(f"Error handling AI response: {e}")
+        traceback.print_exc()
+
+# Configure and initialize Gemini AI
+def init_ai():
+    api_key = "AIzaSyCLEAXjjo0WBLMaBwHO-idX6SgR9mByAN0"
+    try:
+        genai.configure(api_key=api_key)
+        
+        # List available models
+        models = genai.list_models()
+        for m in models:
+            print(f"Found model: {m.name}")
+            
+        # Initialize model
+        model = genai.GenerativeModel('gemini-pro')
+        
+        # Test the model
+        test_response = model.generate_content("Test message")
+        if test_response and test_response.text:
+            print("AI Assistant initialized and tested successfully!")
+            return model
+        else:
+            print("Model initialization failed - no response from test")
+            return None
+    except Exception as e:
+        print(f"Failed to initialize AI Assistant: {e}")
+        traceback.print_exc()
+        return None
+
+ai_model = init_ai()
+
+def get_ai_response(message):
+    """Generate AI response using Gemini or fallback to basic responses"""
+    try:
+        # Check if AI model is available
+        if ai_model is None:
+            # Fallback responses if AI is not available
+            fallback_responses = {
+                "hello": "Hello! I'm your chat assistant. How can I help you today?",
+                "hi": "Hi there! What can I do for you?",
+                "help": "I can help you with:\n- Chat room navigation\n- General questions\n- Basic assistance\nJust let me know what you need!",
+                "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+                "default": [
+                    "I'm here to help! What would you like to know?",
+                    "How can I assist you today?",
+                    "Feel free to ask me anything!",
+                    "I'm listening! What's on your mind?"
+                ]
+            }
+            
+            message_lower = message.lower()
+            for key, response in fallback_responses.items():
+                if key in message_lower:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(fallback_responses["default"])
+
+        # If AI model is available, use it
+        try:
+            generation_config = {
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200
+            }
+            
+            response = ai_model.generate_content(message, generation_config=generation_config)
+            
+            if response and response.text:
+                # Limit response length if needed
+                text = response.text.strip()
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                return text
+            return "I couldn't generate a response at this moment."
+        except Exception as inner_e:
+            print(f"Error with Gemini response: {inner_e}")
+            traceback.print_exc()
+            return "I encountered an error with my AI service. Using a simpler response!"
+            
+    except Exception as e:
+        print(f"Error in get_ai_response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble, but I'm still here to help!"
+        
+        if response and response.text:
+            # Limit response length if needed
+            text = response.text.strip()
+            if len(text) > 500:
+                text = text[:497] + "..."
+            return text
+        return "I couldn't generate a response at this moment."
+            
+    except Exception as e:
+        print(f"Error in get_ai_response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble, but I'm still here to help!"
+            # Fallback responses if AI is not available
+            responses = {
+                "hello": "Hello! I'm your chat assistant. How can I help you today?",
+                "hi": "Hi there! What can I do for you?",
+                "help": "I can help you with:\n- Chat room navigation\n- General questions\n- Basic assistance\nJust let me know what you need!",
+                "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+                "default": [
+                    "I'm here to help! What would you like to know?",
+                    "How can I assist you today?",
+                    "Feel free to ask me anything!",
+                    "I'm listening! What's on your mind?"
+                ]
+            }
+            
+            message = message.lower()
+            for key, response in responses.items():
+                if key in message:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(responses["default"])
+
+        # If AI model is available, use it
+        try:
+            generation_config = {
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200,
+            }
+            
+            response = ai_model.generate_content(
+                message,
+                generation_config=generation_config
+            )
+            
+            if response and response.text:
+                # Limit response length if needed
+                text = response.text.strip()
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                return text
+            return "I couldn't generate a response at this moment."
+            
+        except Exception as inner_e:
+            print(f"Error with Gemini response: {inner_e}")
+            traceback.print_exc()
+            return "I encountered an error with my AI service. Trying a simpler response!"
+            
+    except Exception as e:
+        print(f"Error in get_ai_response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble, but I'm still here to help!"
+            # Fallback responses if AI is not available
+            responses = {
+                "hello": "Hello! I'm your chat assistant. How can I help you today?",
+                "hi": "Hi there! What can I do for you?",
+                "help": "I can help you with:\n- Chat room navigation\n- General questions\n- Basic assistance\nJust let me know what you need!",
+                "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+                "default": [
+                    "I'm here to help! What would you like to know?",
+                    "How can I assist you today?",
+                    "Feel free to ask me anything!",
+                    "I'm listening! What's on your mind?"
+                ]
+            }
+            
+            message = message.lower()
+            for key, response in responses.items():
+                if key in message:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(responses["default"])
+        
+        # Use Gemini AI
+        response = ai_model.generate_content(
+            message,
+            generation_config={
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200,
+            }
+        )
+        
+        if response and response.text:
+            return response.text.strip()
+        return "I couldn't generate a response at this moment."
+        
+    except Exception as e:
+        print(f"Error generating AI response: {e}")
+        traceback.print_exc()
+        return "I'm having trouble right now, but I'm still here to help!"
+
+class AIAssistant:
+    def __init__(self):
+        try:
+            print("Initializing AI Assistant...")
+            model_name = 'gemini-pro'
+            self.model = genai.GenerativeModel(model_name)
+            print(f"Successfully initialized model: {model_name}")
+            
+            # Test the model
+            response = self.model.generate_content("Test message")
+            if response and response.text:
+                print("AI Assistant ready!")
+                self.is_working = True
+            else:
+                print("Model initialization failed - falling back to basic responses")
+                self.is_working = False
+                
+        except Exception as e:
+            print(f"Error initializing AI: {e}")
+            traceback.print_exc()
+            self.is_working = False
+            self.model = None
+    
+    def get_response(self, message):
+        try:
+            if not self.is_working:
+                return self._get_fallback_response(message)
+                
+            response = self.model.generate_content(
+                message,
+                generation_config={
+                    "temperature": 0.7,
+                    "top_k": 40,
+                    "top_p": 0.8,
+                    "max_output_tokens": 200,
+                }
+            )
+            
+            if response and response.text:
+                return response.text.strip()
+            return self._get_fallback_response(message)
+            
+        except Exception as e:
+            print(f"Error generating AI response: {e}")
+            return self._get_fallback_response(message)
+    
+    def _get_fallback_response(self, message):
+        responses = {
+            "hello": "Hello! I'm your chat assistant. How can I help you today?",
+            "hi": "Hi there! What can I do for you?",
+            "help": "I can help you with:\n- Chat room navigation\n- General questions\n- Basic assistance\nJust let me know what you need!",
+            "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+            "default": [
+                "I'm here to help! What would you like to know?",
+                "How can I assist you today?",
+                "Feel free to ask me anything!",
+                "I'm listening! What's on your mind?"
+            ]
+        }
+        
+        message = message.lower()
+        for key, response in responses.items():
+            if key in message:
+                return response if isinstance(response, str) else random.choice(response)
+        return random.choice(responses["default"])
+
+# Initialize the AI Assistant
+ai = AIAssistant()
+
+def get_ai_response(message):
+    return ai.get_response(message)
+
+model = init_gemini()
+
+# Helper function for AI response
+def get_ai_response(message):
+    try:
+        if model is None:
+            # Fallback responses if model fails
+            responses = {
+                "hello": "Hello! How can I help you today?",
+                "help": "I can help you with chat navigation and general questions.",
+                "time": f"The current time is {datetime.now().strftime('%H:%M')}",
+                "default": [
+                    "I'm here to help! What would you like to know?",
+                    "I'm your chat assistant. How can I assist you?",
+                    "Feel free to ask me anything!",
+                    "I'll do my best to help you with your question."
+                ]
+            }
+            
+            message = message.lower()
+            for key, response in responses.items():
+                if key in message:
+                    return response if isinstance(response, str) else random.choice(response)
+            return random.choice(responses["default"])
+            
+        # If model is available, use it
+        response = model.generate_content(
+            message,
+            generation_config={
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.8,
+                "max_output_tokens": 200,
+            }
+        )
+        
+        if response and response.text:
+            return response.text.strip()
+        else:
+            return "I couldn't generate a response at this moment."
+    except Exception as e:
+        error_msg = f"Error generating response: {str(e)}"
+        print(error_msg)
+        traceback.print_exc()
+        return "I'm having trouble with my AI service, but I'll still try to help you!"
+    def __init__(self):
+        self.responses = {
+            'hello': [
+                "Hello! I'm your chat assistant. How can I help you today?",
+                "Hi there! What can I do for you?",
+                "Greetings! I'm here to help!"
+            ],
+            'help': [
+                "I can help you with:\n- Chatting and room navigation\n- Basic questions and information\n- General conversation\nJust ask me anything!",
+                "Need help? Here's what I can do:\n- Answer questions\n- Assist with chat features\n- Provide information\nWhat would you like to know?"
+            ],
+            'room': [
+                "You can join different chat rooms by using the 'Join Room' feature. Each room is separate and has its own participants.",
+                "Rooms are like separate chat spaces. You can join multiple rooms and switch between them!"
+            ],
+            'time': [
+                f"The current time is {datetime.now().strftime('%H:%M')}",
+                f"It's {datetime.now().strftime('%H:%M')} right now!"
+            ]
+        }
+        
+        self.default_responses = [
+            "I'm here to help! Could you tell me more about what you need?",
+            "Interesting question! Let me try to help you with that.",
+            "I'd be happy to assist. Could you provide more details?",
+            "I'm your chat assistant. What would you like to know more about?"
+        ]
+        
+    def get_response(self, message):
+        try:
+            message = message.lower()
+            
+            # Check for keyword matches
+            for key, response_list in self.responses.items():
+                if key in message:
+                    return random.choice(response_list)
+            
+            # Add some context-aware responses
+            if 'who are you' in message or 'what are you' in message:
+                return "I'm your friendly chat assistant, here to help you with messages, rooms, and general questions!"
+            elif 'how' in message and ('use' in message or 'work' in message):
+                return "To use the chat: type messages normally, use @ai to talk to me, and join different rooms using the room controls!"
+            elif 'thank' in message:
+                return "You're welcome! Let me know if you need anything else!"
+            
+            return random.choice(self.default_responses)
+            
+        except Exception as e:
+            print(f"Error in AI response: {str(e)}")
+            return "I'm having trouble right now, but I'm still here to help!"
+
+# Initialize our simple AI
+# Print startup message
+print("AI system initialized. Ready to process messages.")        # Generate response from Gemini with timeout
+        response = model.generate_content(
+            message,
+            generation_config=generation_config,
+            safety_settings=[{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}]
+        )
+        
+        if response and response.text:
+            # Limit response length if it's too long
+            text = response.text.strip()
+            if len(text) > 500:
+                text = text[:497] + "..."
+            return text
+        else:
+            return "I couldn't generate a response at this moment."
+    except Exception as e:
+        error_msg = f"Error with Gemini API: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        return f"I encountered an error: {str(e)}"        # Check for matching keywords
+        for key, response_list in responses.items():
+            if key in message:
+                return random.choice(response_list)
+        
+        # Default responses for unmatched queries
+        default_responses = [
+            "I understand you're asking for help. Could you be more specific?",
+            "I'm here to help! Could you rephrase your question?",
+            "I'm not sure about that, but I can help with chat-related questions!",
+            "Interesting question! Could you provide more details?"
+        ]
+        
+        return random.choice(default_responses)
+        
+    except Exception as e:
+        error_msg = f"Error generating response: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        return "I encountered an error. Please try again."
+
+# User sends a message
+@socketio.on('message')
+def handle_message(data):
+    if 'user_id' not in session:
+        return
+    
+    room = data.get('room')
+    user = session['username']
+    text = data.get('msg')
+    recipient = data.get('recipient')
+    is_ai_query = text.startswith('@ai ')
+    
+    payload = {
+        'id': str(uuid.uuid4()),
+        'msg': f"{user}: {text}",
+        'system': False,
+        'ts': int(time.time() * 1000),
+        'private': bool(recipient)
+    }
+    
+    # Store in chat history
+    if room not in chat_history:
+        chat_history[room] = []
+    chat_history[room].append(payload)
+    
+    # Save message to database (for persistent storage if needed)
+    message = Message(
+        content=text,
+        room=room,
+        user_id=session['user_id']
+    )
+    
+    if recipient:
+        recipient_user = User.query.filter_by(username=recipient).first()
+        if recipient_user:
+            message.is_private = True
+            message.recipient_id = recipient_user.id
+            socketio.emit('private_message', payload, room=request.sid)
+            socketio.emit('private_message', payload, room=recipient_user.id)
+    else:
+        # Send to everyone in the room including sender
+        socketio.emit('message', payload, to=room)
+        
+        # Handle AI assistant response if message starts with @ai
+        if is_ai_query:
+            ai_query = text[4:].strip()  # Remove '@ai ' prefix
+            # Add context to the AI query
+            prompt = f"""You are an AI assistant in a chat room. Please provide a helpful and friendly response to the following query:
+            User Query: {ai_query}
+            
+            Please keep your response concise and relevant to the chat context."""
+            
+            def process_ai_response():
+                try:
+                    import threading
+                    import queue
+
+                    # Create a queue for the response
+                    response_queue = queue.Queue()
+                    
+                    # Send an immediate acknowledgment
+                    processing_payload = {
+                        'id': str(uuid.uuid4()),
+                        'msg': "AI Assistant: Processing your request...",
+                        'system': True,
+                        'ts': int(time.time() * 1000),
+                        'private': False,
+                        'isAI': True
+                    }
+                    socketio.emit('message', processing_payload, to=room)
+                    
+                    def get_response():
+                        try:
+                            ai_response = get_ai_response(prompt)
+                            response_queue.put(ai_response)
+                        except Exception as e:
+                            response_queue.put(f"Error: {str(e)}")
+                    
+                    # Start response thread
+                    response_thread = threading.Thread(target=get_response)
+                    response_thread.daemon = True
+                    response_thread.start()
+                    
+                    # Wait for response with timeout
+                    try:
+                        ai_response = response_queue.get(timeout=15)  # 15 second timeout
+                    except queue.Empty:
+                        ai_response = "Response took too long. Please try again."
+                    
+                    # Send the actual response
+                    ai_payload = {
+                        'id': str(uuid.uuid4()),
+                        'msg': f"AI Assistant: {ai_response}",
+                        'system': False,
+                        'ts': int(time.time() * 1000),
+                        'private': False,
+                        'isAI': True
+                    }
+                    chat_history[room].append(ai_payload)
+                    socketio.emit('message', ai_payload, to=room)
+                except Exception as e:
+                    error_msg = f"Error processing AI response: {str(e)}"
+                    print(error_msg)
+                    traceback.print_exc()
+                    error_payload = {
+                        'id': str(uuid.uuid4()),
+                        'msg': f"AI Assistant: Sorry, I encountered an error: {str(e)}",
+                        'system': True,
+                        'ts': int(time.time() * 1000),
+                        'private': False,
+                        'isAI': True
+                    }
+                    socketio.emit('message', error_payload, to=room)
+            
+            # Start AI processing in a separate thread
+            Thread(target=process_ai_response).start()
+    
+    db.session.add(message)
+    db.session.commit()
+    
+    payload = {
+        'id': str(uuid.uuid4()),
+        'msg': f"{user}: {text}",
+        'system': False,
+        'ts': int(time.time() * 1000),
+        'private': bool(recipient)
+    }
+    
+    if recipient:
+        # Send private message only to recipient
+        recipient_sid = next((sid for sid, user in online_users.items() if user == recipient), None)
+        if recipient_sid:
+            socketio.emit('private_message', payload, room=recipient_sid)
+    else:
+        # Broadcast to room
+        socketio.emit('message', payload, to=room, include_self=False)
+
+# Typing indicator
+@socketio.on('typing')
+def handle_typing(data):
+    room = data.get('room')
+    username = data.get('username')
+    socketio.emit('typing', {'username': username, 'typing': True}, to=room, include_self=False)
+
+if __name__ == '__main__':
+    # Use your local IPv4 address to access from other devices on same Wi-Fi
+    socketio.run(app, host='127.0.0.1', port=5000, debug=True)
