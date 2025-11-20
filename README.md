@@ -20,7 +20,19 @@ Google Gemini AI API
 1️⃣ Install Dependencies
 
 
-pip install -r requirements.txt
+pip install flask
+
+
+pip install flask-socketio
+
+
+pip install eventlet
+
+
+pip install sqlalchemy
+
+
+pip install google-generativeai
 
 
 (or manually install Flask, Flask-SocketIO, SQLAlchemy)
